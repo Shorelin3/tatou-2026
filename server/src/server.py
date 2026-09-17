@@ -6,6 +6,7 @@ from pathlib import Path
 from functools import wraps
 
 from flask import Flask, jsonify, request, g, send_file
+from rmap import RMAPServer, RMAPError
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
@@ -37,8 +38,37 @@ def create_app():
     app.config["DB_HOST"] = os.environ.get("DB_HOST", "db")
     app.config["DB_PORT"] = int(os.environ.get("DB_PORT", "3306"))
     app.config["DB_NAME"] = os.environ.get("DB_NAME", "tatou")
+    
+    app.config["RMAP_KEYS_DIR"] = Path(
+    	os.environ.get("RMAP_KEYS_DIR", "./keys")
+    ).resolve()
+
+    app.config["RMAP_SERVER_PUBLIC_KEY"] = Path(
+    	os.environ.get("RMAP_SERVER_PUBLIC_KEY", "./keys/server-public.asc")
+    ).resolve()
+
+    app.config["RMAP_SERVER_PRIVATE_KEY"] = Path(
+    	os.environ.get("RMAP_SERVER_PRIVATE_KEY", "./keys/server-private.asc")
+    ).resolve()
 
     app.config["STORAGE_DIR"].mkdir(parents=True, exist_ok=True)
+
+    # --- RMAP ---
+    rmap_server = None
+
+    if (
+        app.config["RMAP_SERVER_PUBLIC_KEY"].exists()
+        and app.config["RMAP_SERVER_PRIVATE_KEY"].exists()
+    ):
+        rmap_server = RMAPServer(
+            app.config["RMAP_SERVER_PUBLIC_KEY"],
+            app.config["RMAP_SERVER_PRIVATE_KEY"],
+        )
+
+        if app.config["RMAP_KEYS_DIR"].exists():
+            rmap_server.loadIdentities(app.config["RMAP_KEYS_DIR"])
+
+    app.config["RMAP_SERVER"] = rmap_server
 
     # --- DB engine only (no Table metadata) ---
     def db_url() -> str:
