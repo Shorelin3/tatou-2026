@@ -40,7 +40,7 @@ def create_app():
     app.config["DB_NAME"] = os.environ.get("DB_NAME", "tatou")
     
     app.config["RMAP_KEYS_DIR"] = Path(
-    	os.environ.get("RMAP_KEYS_DIR", "./keys")
+    	os.environ.get("RMAP_KEYS_DIR", "./keys/clients")
     ).resolve()
 
     app.config["RMAP_SERVER_PUBLIC_KEY"] = Path(
@@ -134,6 +134,18 @@ def create_app():
         except Exception:
             db_ok = False
         return jsonify({"message": "The server is up and running.", "db_connected": db_ok}), 200
+
+    @app.post("/rmap-initiate")
+    def rmap_initiate():
+        if rmap_server is None:
+            return jsonify({"error": "RMAP is not configured"}), 503
+
+        try:
+            identity, response = rmap_server.receiveMsg1(request.get_json())
+            return jsonify(response)
+        except Exception as exc:
+            app.logger.warning("RMAP initiate failed: %s", exc)
+            return jsonify({"error": "RMAP authentication failed"}), 400
 
     # POST /api/create-user {email, login, password}
     @app.post("/api/create-user")
