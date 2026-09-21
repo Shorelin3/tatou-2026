@@ -43,7 +43,11 @@ from watermarking_method import (
 )
 from add_after_eof import AddAfterEOF
 from unsafe_bash_bridge_append_eof import UnsafeBashBridgeAppendEOF
+<<<<<<< Updated upstream
 from visible_hmac import VisibleHMAC
+=======
+from visible_watermark import visibleWatermark
+>>>>>>> Stashed changes
 
 # --------------------
 # Method registry
@@ -52,7 +56,11 @@ from visible_hmac import VisibleHMAC
 METHODS: Dict[str, WatermarkingMethod] = {
     AddAfterEOF.name: AddAfterEOF(),
     UnsafeBashBridgeAppendEOF.name: UnsafeBashBridgeAppendEOF(),
+<<<<<<< Updated upstream
     VisibleHMAC.name: VisibleHMAC(),
+=======
+    visibleWatermark.name: visibleWatermark(),
+>>>>>>> Stashed changes
 }
 """Registry of available watermarking methods.
 
