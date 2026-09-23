@@ -14,7 +14,6 @@ from watermarking_method import (
     load_pdf_bytes,
 )
 
-
 class VisibleHMAC(WatermarkingMethod):
     name = "visible-hmac"
 
@@ -25,7 +24,6 @@ class VisibleHMAC(WatermarkingMethod):
     def get_usage() -> str:
         return (
             "Embeds a visible HMAC-authenticated watermark into the PDF "
-            "page content. Position may specify placement."
         )
 
     def add_watermark(
@@ -74,7 +72,8 @@ class VisibleHMAC(WatermarkingMethod):
             for page in doc:
                 rect = page.rect
 
-                text = "WATERMARKED • 7F3A91C2"
+                identifier = hashlib.sha256(secret.encode("utf-8")).hexdigest()[:12]
+                text = "WATERMARKED • " + identifier
                 fontsize = 28
 
                 text_width = fitz.get_text_length(
@@ -83,7 +82,7 @@ class VisibleHMAC(WatermarkingMethod):
                     fontsize=fontsize,
                 )
 
-                text_height = fontsize  # Approximation; could use font metrics for precision
+                text_height = fontsize  
 
                 page_center = fitz.Point(
                     rect.width / 2,
@@ -109,7 +108,8 @@ class VisibleHMAC(WatermarkingMethod):
                         text_center,
                         fitz.Matrix(1, 1).prerotate(45),
                     ),
-                    fill_opacity=0.3,
+                    fill=(1, 0, 0),
+                    fill_opacity=0.5,
                 )
 
             return doc.tobytes()

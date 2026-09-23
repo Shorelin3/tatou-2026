@@ -59,7 +59,7 @@ METHODS: Dict[str, WatermarkingMethod] = {
     DuplicateWatermark.name: DuplicateWatermark(),
     MicroDotWatermark.name: MicroDotWatermark(),
 
-
+    
 }
 """Registry of available watermarking methods.
 

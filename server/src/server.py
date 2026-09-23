@@ -38,6 +38,20 @@ def create_app():
     app.config["DB_HOST"] = os.environ.get("DB_HOST", "db")
     app.config["DB_PORT"] = int(os.environ.get("DB_PORT", "3306"))
     app.config["DB_NAME"] = os.environ.get("DB_NAME", "tatou")
+
+    # Configure which document is used for RMAP watermarking;
+    # defaults to document 10 for local development and testing.
+    app.config["RMAP_DOCUMENT_ID"] = int(
+        os.environ.get("RMAP_DOCUMENT_ID", "10")
+    )
+
+    app.config["RMAP_WATERMARK_KEY"] = os.environ.get(
+        "RMAP_WATERMARK_KEY"
+    )
+
+    app.config["RMAP_WATERMARK_METHOD"] = os.environ.get(
+        "RMAP_WATERMARK_METHOD", "visible-hmac"
+    )
     
     app.config["RMAP_KEYS_DIR"] = Path(
     	os.environ.get("RMAP_KEYS_DIR", "./keys/clients")
@@ -51,6 +65,10 @@ def create_app():
     	os.environ.get("RMAP_SERVER_PRIVATE_KEY", "./keys/server-private.asc")
     ).resolve()
 
+    app.config["RMAP_KEY_PASSPHRASE"] = os.environ.get(
+        "RMAP_KEY_PASSPHRASE"
+    )
+
     app.config["STORAGE_DIR"].mkdir(parents=True, exist_ok=True)
 
     # --- RMAP ---
@@ -63,6 +81,7 @@ def create_app():
         rmap_server = RMAPServer(
             app.config["RMAP_SERVER_PUBLIC_KEY"],
             app.config["RMAP_SERVER_PRIVATE_KEY"],
+            app.config["RMAP_KEY_PASSPHRASE"],
         )
 
         if app.config["RMAP_KEYS_DIR"].exists():
@@ -146,6 +165,156 @@ def create_app():
         except Exception as exc:
             app.logger.warning("RMAP initiate failed: %s", exc)
             return jsonify({"error": "RMAP authentication failed"}), 400
+
+    @app.post("/rmap-get-link")
+    def rmap_get_link():
+        if rmap_server is None:
+            return jsonify({"error": "RMAP is not configured"}), 503
+
+        try:
+            identity, expected_link, response = rmap_server.receiveMsg2(
+                request.get_json()
+            )
+
+            document_id = app.config["RMAP_DOCUMENT_ID"]
+
+            # Look up the document configured for RMAP watermarking.
+            with get_engine().connect() as conn:
+                row = conn.execute(
+                    text("""
+                    SELECT id, name, path
+                    FROM Documents
+                    WHERE id = :id
+                    LIMIT 1
+                """),
+                {"id": document_id},
+            ).first()
+
+            if not row:
+                return jsonify({"error": "RMAP document not found"}), 404
+
+            # Resolve the document path safely under STORAGE_DIR.
+            storage_root = Path(app.config["STORAGE_DIR"]).resolve()
+            file_path = Path(row.path)
+
+            if not file_path.is_absolute():
+                file_path = storage_root / file_path
+
+            file_path = file_path.resolve()
+
+            try:
+                file_path.relative_to(storage_root)
+            except ValueError:
+                return jsonify({"error": "RMAP document path invalid"}), 500
+
+            if not file_path.exists():
+                return jsonify({"error": "RMAP document file missing"}), 410
+
+            method = app.config["RMAP_WATERMARK_METHOD"]
+            secret = identity
+            key = app.config["RMAP_WATERMARK_KEY"]
+
+            if not key:
+                return jsonify({"error": "RMAP watermark key not configured"}), 503
+
+            try:
+                applicable = WMUtils.is_watermarking_applicable(
+                    method=method,
+                    pdf=str(file_path),
+                    position=None,
+                )
+                if applicable is False:
+                    return jsonify({
+                        "error": "RMAP watermarking method not applicable"
+                    }), 400
+            except Exception as e:
+                return jsonify({
+                    "error": f"RMAP watermark applicability check failed: {e}"
+                }), 400
+
+            try:
+                wm_bytes: bytes = WMUtils.apply_watermark(
+                    pdf=str(file_path),
+                    secret=secret,
+                    key=key,
+                    method=method,
+                    position=None,
+                )
+
+                if not isinstance(wm_bytes, (bytes, bytearray)) or not wm_bytes:
+                    return jsonify({
+                        "error": "RMAP watermarking produced no output"
+                    }), 500
+
+            except Exception as e:
+                return jsonify({
+                    "error": f"RMAP watermarking failed: {e}"
+                }), 500
+
+            base_name = Path(row.name or file_path.name).stem
+            identity_slug = secure_filename(identity) or "unknown"
+            dest_dir = file_path.parent / "watermarks"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+
+            candidate = f"{base_name}__rmap__{identity_slug}__{expected_link}.pdf"
+            dest_path = dest_dir / candidate
+
+            try:
+                with dest_path.open("wb") as f:
+                    f.write(wm_bytes)
+            except Exception as e:
+                return jsonify({
+                    "error": f"failed to write RMAP watermarked file: {e}"
+                }), 500
+
+            try:
+                with get_engine().begin() as conn:
+                    conn.execute(
+                        text("""
+                            INSERT INTO Versions (
+                                documentid,
+                                link,
+                                intended_for,
+                                secret,
+                                method,
+                                position,
+                                path
+                            )
+                            VALUES (
+                                :documentid,
+                                :link,
+                                :intended_for,
+                                :secret,
+                                :method,
+                                :position,
+                                :path
+                            )
+                        """),
+                        {
+                            "documentid": document_id,
+                            "link": expected_link,
+                            "intended_for": identity,
+                            "secret": secret,
+                            "method": method,
+                            "position": "",
+                            "path": dest_path,
+                        },
+                    )
+            except Exception as e:
+                try:
+                    dest_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+                return jsonify({
+                    "error": f"database error during RMAP version insert: {e}"
+                }), 503
+
+            return jsonify(response)
+        
+        except Exception as exc:
+            app.logger.warning("RMAP get-link failed: %s", exc)
+            return jsonify({"error": "RMAP get-link failed"}), 400
 
     # POST /api/create-user {email, login, password}
     @app.post("/api/create-user")
