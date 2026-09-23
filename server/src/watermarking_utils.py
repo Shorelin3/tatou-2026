@@ -46,7 +46,6 @@ from add_after_eof import AddAfterEOF
 from unsafe_bash_bridge_append_eof import UnsafeBashBridgeAppendEOF
 from visible_hmac import VisibleHMAC
 from duplicate_watermark import DuplicateWatermark
-from visible_watermark import visibleWatermark
 from microdot_watermark import MicroDotWatermark
 
 # --------------------
@@ -58,7 +57,6 @@ METHODS: Dict[str, WatermarkingMethod] = {
     UnsafeBashBridgeAppendEOF.name: UnsafeBashBridgeAppendEOF(),
     VisibleHMAC.name: VisibleHMAC(),
     DuplicateWatermark.name: DuplicateWatermark(),
-    visibleWatermark.name: visibleWatermark(),
     MicroDotWatermark.name: MicroDotWatermark(),
 
 
