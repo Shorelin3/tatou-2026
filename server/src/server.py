@@ -1,6 +1,7 @@
 import os
 import io
 import hashlib
+import uuid
 import datetime as dt
 from pathlib import Path
 from functools import wraps
@@ -816,7 +817,8 @@ def create_app():
         dest_dir = file_path.parent / "watermarks"
         dest_dir.mkdir(parents=True, exist_ok=True)
 
-        candidate = f"{base_name}__{intended_slug}.pdf"
+        unique_id = uuid.uuid4().hex
+        candidate = f"{base_name}__{intended_slug}_{unique_id}.pdf"
         dest_path = dest_dir / candidate
 
         # write bytes
