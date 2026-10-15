@@ -21,7 +21,7 @@ def test_healthz_route(monkeypatch):
     monkeypatch.setitem(app.config, "_ENGINE", WorkingEngine())
 
     client = app.test_client()
-    resp = client.get("/healthz")
+    resp = client.get("/api/healthz")
 
     assert resp.status_code == 200
     assert resp.is_json
@@ -36,7 +36,7 @@ def test_healthz_returns_503_when_database_is_unavailable(monkeypatch, caplog):
 
     with caplog.at_level(logging.ERROR, logger="server"):
         client = app.test_client()
-        resp = client.get("/healthz")
+        resp = client.get("/api/healthz")
 
     assert resp.status_code == 503
     assert resp.is_json
