@@ -84,7 +84,7 @@ def main():
     # ------------------------------------------------------------
 
     msg1 = client.build_msg1()
-    resp1 = post_json("/rmap-initiate", msg1)
+    resp1 = post_json("/api/rmap-initiate", msg1)
     client.process_resp1(resp1)
 
     print("[PASS] Message 1 -> Response 1")
@@ -95,7 +95,7 @@ def main():
     # ------------------------------------------------------------
 
     msg2 = client.build_msg2()
-    resp2 = post_json("/rmap-get-link", msg2)
+    resp2 = post_json("/api/rmap-get-link", msg2)
     link = client.process_resp2(resp2)
 
     print("[PASS] Message 2 -> Response 2")
