@@ -25,3 +25,9 @@ python_files = ["test_*.py"]
 
 [project.scripts]
 pdfwm = "watermarking_cli:main"                 # now you can run `pdfwm methods`
+[tool.mutmut]
+source_paths = ["src/add_after_eof.py"]
+also_copy = ["src/watermarking_method.py"]
+pytest_add_cli_args_test_selection = ["test/test_add_after_eof_mutation.py"]
+debug = true
+
