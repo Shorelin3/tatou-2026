@@ -216,7 +216,7 @@ def create_app():
     def home():
         return app.send_static_file("index.html")
     
-    @app.get("/healthz")
+    @app.get("/api/healthz")
     def healthz():
         try:
             with get_engine().connect() as conn:
@@ -232,7 +232,7 @@ def create_app():
                 "db_connected": False,
             }), 503
 
-    @app.post("/rmap-initiate")
+    @app.post("/api/rmap-initiate")
     def rmap_initiate():
         if rmap_server is None:
             return jsonify({"error": "RMAP is not configured"}), 503
@@ -251,7 +251,7 @@ def create_app():
 
             return jsonify({"error": "RMAP authentication failed"}), 400
 
-    @app.post("/rmap-get-link")
+    @app.post("/api/rmap-get-link")
     def rmap_get_link():
         if rmap_server is None:
             return jsonify({"error": "RMAP is not configured"}), 503
@@ -799,72 +799,124 @@ def create_app():
                 raise RuntimeError(f"path {fp} escapes storage root {storage_root}")
         return fp
 
+
     # DELETE /api/delete-document  (and variants)
-    @app.route("/api/delete-document", methods=["DELETE", "POST"])  # POST supported for convenience
+    @app.route("/api/delete-document", methods=["DELETE", "POST"])
     @app.route("/api/delete-document/<document_id>", methods=["DELETE"])
+    @require_auth
     def delete_document(document_id: int | None = None):
-        # accept id from path, query (?id= / ?documentid=), or JSON body on POST
-        if not document_id:
+        # Accept the ID from the path, query parameters, or JSON body.
+        if document_id is None:
             document_id = (
                 request.args.get("id")
                 or request.args.get("documentid")
-                or (request.is_json and (request.get_json(silent=True) or {}).get("id"))
+                or (
+                    (request.get_json(silent=True) or {}).get("id")
+                    if request.is_json
+                    else None
+                )
             )
+ 
+ 
+        # Validate the document ID.
         try:
-            doc_id = document_id
+            doc_id = int(document_id)
+            if doc_id <= 0:
+                raise ValueError
         except (TypeError, ValueError):
-            return jsonify({"error": "document id required"}), 400
+            return jsonify({"error": "valid document id required"}), 400
 
-        # Fetch the document (enforce ownership)
+
+        # Retrieve only a document owned by the authenticated user.
         try:
             with get_engine().connect() as conn:
-                query = "SELECT * FROM Documents WHERE id = " + doc_id
-                row = conn.execute(text(query)).first()
-        except Exception as e:
-            return jsonify({"error": f"database error: {str(e)}"}), 503
+                row = conn.execute(
+                    text("""
+                        SELECT *
+                        FROM Documents
+                        WHERE id = :id AND ownerid = :ownerid
+                    """),
+                    {
+                        "id": doc_id,
+                        "ownerid": int(g.user["id"]),
+                    },
+                ).first()
+        except Exception:
+            app.logger.exception(
+                "Database error while checking document ownership"
+            )
+            return jsonify({"error": "database error"}), 503
 
-        if not row:
-            # Don’t reveal others’ docs—just say not found
+
+        if row is None:
             return jsonify({"error": "document not found"}), 404
 
-        # Resolve and delete file (best effort)
+
+        # Validate the file path before deleting the database record.
         storage_root = Path(app.config["STORAGE_DIR"])
+
+
+        try:
+            file_path = _safe_resolve_under_storage(row.path, storage_root)
+        except (RuntimeError, OSError, ValueError):
+            app.logger.exception(
+                "Document path failed storage safety check for id=%s",
+                doc_id,
+            )
+            return jsonify({"error": "document path invalid"}), 500
+ 
+ 
+        # Delete the database record only if ownership still matches.
+        try:
+            with get_engine().begin() as conn:
+                result = conn.execute(
+                    text("""
+                        DELETE FROM Documents
+                        WHERE id = :id AND ownerid = :ownerid
+                    """),
+                    {
+                        "id": doc_id,
+                        "ownerid": int(g.user["id"]),
+                    },
+                )
+ 
+ 
+                if result.rowcount != 1:
+                    return jsonify({"error": "document not found"}), 404
+ 
+ 
+        except Exception:
+            app.logger.exception("Database error during document deletion")
+            return jsonify({"error": "database error during delete"}), 503
+
+
+        # Remove the file after the database deletion succeeds.
         file_deleted = False
         file_missing = False
         delete_error = None
+
+
         try:
-            fp = _safe_resolve_under_storage(row.path, storage_root)
-            if fp.exists():
-                try:
-                    fp.unlink()
-                    file_deleted = True
-                except Exception as e:
-                    delete_error = f"failed to delete file: {e}"
-                    app.logger.warning("Failed to delete file %s for doc id=%s: %s", fp, row.id, e)
+            if file_path.exists():
+                file_path.unlink()
+                file_deleted = True
             else:
                 file_missing = True
-        except RuntimeError as e:
-            # Path escapes storage root; refuse to touch the file
-            delete_error = str(e)
-            app.logger.error("Path safety check failed for doc id=%s: %s", row.id, e)
-
-        # Delete DB row (will cascade to Version if FK has ON DELETE CASCADE)
-        try:
-            with get_engine().begin() as conn:
-                # If your schema does NOT have ON DELETE CASCADE on Version.documentid,
-                # uncomment the next line first:
-                # conn.execute(text("DELETE FROM Version WHERE documentid = :id"), {"id": doc_id})
-                conn.execute(text("DELETE FROM Documents WHERE id = :id"), {"id": doc_id})
-        except Exception as e:
-            return jsonify({"error": f"database error during delete: {str(e)}"}), 503
-
+        except OSError:
+            delete_error = "document record deleted but file removal failed"
+            app.logger.exception(
+                "Failed to delete file for document id=%s",
+                doc_id,
+            )
+ 
+ 
         return jsonify({
             "deleted": True,
             "id": doc_id,
             "file_deleted": file_deleted,
             "file_missing": file_missing,
-            "note": delete_error,   # null/omitted if everything was fine
-        }), 200
+            "note": delete_error,
+        }), 200   
         
     # POST /api/create-watermark or /api/create-watermark/<id>  → create watermarked pdf and returns metadata
     @app.post("/api/create-watermark")
@@ -1149,16 +1201,20 @@ def create_app():
         if not method or not isinstance(key, str):
             return jsonify({"error": "method, and key are required"}), 400
 
-        # lookup the document; FIXME enforce ownership
+        # retrieve document and enforce ownership
         try:
             with get_engine().connect() as conn:
                 row = conn.execute(
                     text("""
                         SELECT id, name, path
                         FROM Documents
-                        WHERE id = :id
+                        WHERE id = :id AND ownerid = :ownerid
+                        LIMIT 1
                     """),
-                    {"id": doc_id},
+                    {
+                        "id": doc_id,
+                        "ownerid": int(g.user["id"]),
+                    },
                 ).first()
         except Exception as e:
             return jsonify({"error": f"database error: {str(e)}"}), 503
