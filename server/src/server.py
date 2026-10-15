@@ -3,10 +3,13 @@ import io
 import hashlib
 import uuid
 import datetime as dt
+import time
+import logging
 from pathlib import Path
 from functools import wraps
 
 from flask import Flask, jsonify, request, g, send_file
+from security_monitoring import SecurityMonitor
 from rmap import RMAPServer, RMAPError
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -28,6 +31,9 @@ from watermarking_method import WatermarkingMethod
 
 def create_app():
     app = Flask(__name__)
+    app.logger.setLevel(logging.INFO)
+    
+    security_monitor = SecurityMonitor()
 
     # --- Config ---
     app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
@@ -72,6 +78,43 @@ def create_app():
 
     app.config["STORAGE_DIR"].mkdir(parents=True, exist_ok=True)
 
+    # --- Request Logging ---
+    @app.before_request
+    def log_request_start():
+        request.environ["request_start_time"] = time.monotonic()
+    
+    @app.after_request
+    def log_request_end(response):
+        start_time = request.environ.get("request_start_time")
+        duration_ms = (
+            (time.monotonic() - start_time) * 1000
+            if start_time is not None
+            else -1
+        )
+
+        log_path = request.path 
+
+        if request.endpoint == "get_version":
+            log_path = "/api/get-version/<redacted>"
+
+        app.logger.info(
+            "HTTP request method=%s path=%s status=%s duration_ms=%.1f ip=%s",
+            request.method,
+            log_path,
+            response.status_code,
+            duration_ms,
+            request.remote_addr,
+        )
+
+        if 500 <= response.status_code < 600:
+            security_monitor.record_server_error(
+                response.status_code,
+                log_path,
+                app.logger,
+            )
+
+        return response
+    
     # --- RMAP ---
     rmap_server = None
 
@@ -116,15 +159,41 @@ def create_app():
         def wrapper(*args, **kwargs):
             auth = request.headers.get("Authorization", "")
             if not auth.startswith("Bearer "):
+                app.logger.warning(
+                    "Authentication failed: missing or invalid Authorization header path=%s ip=%s",
+                    request.path,
+                    request.remote_addr,
+                )
                 return _auth_error("Missing or invalid Authorization header")
+
             token = auth.split(" ", 1)[1].strip()
             try:
                 data = _serializer().loads(token, max_age=app.config["TOKEN_TTL_SECONDS"])
             except SignatureExpired:
+                app.logger.warning(
+                    "Authentication failed: expired token path=%s ip=%s",
+                    request.path,
+                    request.remote_addr,
+                )
                 return _auth_error("Token expired")
             except BadSignature:
+                app.logger.warning(
+                    "Authentication failed: invalid token path=%s ip=%s",
+                    request.path,
+                    request.remote_addr,
+                )
                 return _auth_error("Invalid token")
             g.user = {"id": int(data["uid"]), "login": data["login"], "email": data.get("email")}
+
+            token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+            
+            security_monitor.record_token_use(
+                token_id,
+                g.user["id"],
+                request.remote_addr,
+                app.logger,
+            )
+
             return f(*args, **kwargs)
         return wrapper
 
@@ -150,10 +219,16 @@ def create_app():
         try:
             with get_engine().connect() as conn:
                 conn.execute(text("SELECT 1"))
-            db_ok = True
+            return jsonify({
+                "message": "The server is up and running.",
+                "db_connected": True,
+            }), 200
         except Exception:
-            db_ok = False
-        return jsonify({"message": "The server is up and running.", "db_connected": db_ok}), 200
+            app.logger.exception("Health check failed: database unavailable")
+            return jsonify({
+                "message": "The server is running but the db is unavailable",
+                "db_connected": False,
+            }), 503
 
     @app.post("/rmap-initiate")
     def rmap_initiate():
@@ -165,6 +240,13 @@ def create_app():
             return jsonify(response)
         except Exception as exc:
             app.logger.warning("RMAP initiate failed: %s", exc)
+
+            security_monitor.record_rmap_auth_failure(
+                request.remote_addr,
+                "/rmap-initiate",
+                app.logger,
+            )
+
             return jsonify({"error": "RMAP authentication failed"}), 400
 
     @app.post("/rmap-get-link")
@@ -177,6 +259,18 @@ def create_app():
                 request.get_json()
             )
 
+        except Exception as exc:
+            app.logger.warning("RMAP get-link authentication failed: %s", exc)
+
+            security_monitor.record_rmap_auth_failure(
+                request.remote_addr,
+                "/rmap-get-link",
+                app.logger,
+            )
+
+            return jsonify({"error": "RMAP authentication failed"}), 400
+        
+        try:
             document_id = app.config["RMAP_DOCUMENT_ID"]
 
             # Look up the document configured for RMAP watermarking.
@@ -365,7 +459,11 @@ def create_app():
         except Exception as e:
             return jsonify({"error": f"database error: {str(e)}"}), 503
 
+        
         if not row or not check_password_hash(row.hpassword, password):
+            ip = request.remote_addr or "unknown"
+            security_monitor.record_failed_login(ip, app.logger)
+
             return jsonify({"error": "invalid credentials"}), 401
 
         token = _serializer().dumps({"uid": int(row.id), "login": row.login, "email": row.email})
@@ -422,6 +520,12 @@ def create_app():
         except Exception as e:
             return jsonify({"error": f"database error: {str(e)}"}), 503
 
+        app.logger.info(
+            "Document uploaded: user_id=%s document_id=%s ip=%s",
+            g.user["id"],
+            int(row.id),
+            request.remote_addr,
+        )
         return jsonify({
             "id": int(row.id),
             "name": row.name,
@@ -551,11 +655,26 @@ def create_app():
                     """),
                     {"id": document_id, "uid": int(g.user["id"])},
                 ).first()
-        except Exception as e:
-            return jsonify({"error": f"database error: {str(e)}"}), 503
+        except Exception:
+            app.logger.exception(
+                "Document retrieval failed: db error user_id=%s document_id=%s ip=%s",
+                g.user["id"],
+                document_id,
+                request.remote_addr,
+            )
+            return jsonify({"error": "service unavailable"}), 503
 
         # Don’t leak whether a doc exists for another user
         if not row:
+            ip = request.remote_addr or "unknown"
+
+            security_monitor.record_denied_document_access(
+                ip,
+                g.user["id"],
+                document_id,
+                app.logger,
+            )
+
             return jsonify({"error": "document not found"}), 404
 
         file_path = Path(row.path)
@@ -580,6 +699,13 @@ def create_app():
             max_age=0,
             last_modified=file_path.stat().st_mtime,
         )
+        app.logger.info(
+            "Document accessed: user_id=%s document_id=%s ip=%s",
+            g.user["id"],
+            document_id,
+            request.remote_addr,
+        )
+
         # Strong validator
         if isinstance(row.sha256_hex, str) and row.sha256_hex:
             resp.set_etag(row.sha256_hex.lower())
@@ -856,6 +982,15 @@ def create_app():
             except Exception:
                 pass
             return jsonify({"error": f"database error during version insert: {e}"}), 503
+        
+        app.logger.info(
+            "Watermarked version created: user_id=%s document_id=%s version_id=%s method=%s ip=%s",
+            g.user["id"],
+            doc_id,
+            vid,
+            method,
+            request.remote_addr,
+        )
 
         return jsonify({
             "id": vid,
@@ -894,7 +1029,7 @@ def create_app():
             return jsonify({"error": f"plugin path error: {e}"}), 500
 
         if not plugin_path.exists():
-            return jsonify({"error": f"plugin file not found: {safe}"}), 404
+            return jsonify({"error": f"plugin file not found: {filename}"}), 404
 
         # Unpickle the object (dill if available; else std pickle)
         try:
@@ -925,6 +1060,14 @@ def create_app():
             
         # Register the class (not an instance) so you can instantiate as needed later
         WMUtils.METHODS[method_name] = cls()
+
+        app.logger.info(
+            "Plugin loaded: user_id=%s filename=%s registered_as=%s ip=%s",
+            g.user["id"],
+            filename,
+            method_name,
+            request.remote_addr,
+        )
         
         return jsonify({
             "loaded": True,
