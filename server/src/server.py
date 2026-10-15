@@ -3,6 +3,7 @@ import io
 import hashlib
 import uuid
 import datetime as dt
+import fitz
 from pathlib import Path
 from functools import wraps
 
@@ -350,12 +351,21 @@ def create_app():
     # POST /api/login {login, password}
     @app.post("/api/login")
     def login():
-        payload = request.get_json(silent=True) or {}
-        email = (payload.get("email") or "").strip()
-        password = payload.get("password") or ""
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "JSON body must be an object"}), 400
+
+        email = payload.get("email")
+        password = payload.get("password")
+
+        if not isinstance(email, str) or not isinstance(password, str):
+            return jsonify({"error": "email and password must be strings"}), 400
+
+        email = email.strip()
+
         if not email or not password:
             return jsonify({"error": "email and password are required"}), 400
-
+        
         try:
             with get_engine().connect() as conn:
                 row = conn.execute(
@@ -382,6 +392,17 @@ def create_app():
             return jsonify({"error": "empty filename"}), 400
 
         fname = file.filename
+
+        # Reject files that cannot be opened as PDFs.
+        file_bytes = file.read()
+        try:
+            with fitz.open(stream=file_bytes, filetype="pdf") as pdf:
+                if not pdf.is_pdf or pdf.page_count < 1:
+                    return jsonify({"error": "file must be a valid PDF"}), 400
+        except Exception:
+            return jsonify({"error": "file must be a valid PDF"}), 400
+
+        file.stream.seek(0)
 
         user_dir = app.config["STORAGE_DIR"] / "files" / g.user["login"]
         user_dir.mkdir(parents=True, exist_ok=True)
@@ -456,8 +477,6 @@ def create_app():
             "size": int(r.size),
         } for r in rows]
         return jsonify({"documents": docs}), 200
-
-
 
     # GET /api/list-versions
     @app.get("/api/list-versions")
@@ -720,7 +739,6 @@ def create_app():
             "note": delete_error,   # null/omitted if everything was fine
         }), 200
         
-        
     # POST /api/create-watermark or /api/create-watermark/<id>  → create watermarked pdf and returns metadata
     @app.post("/api/create-watermark")
     @app.post("/api/create-watermark/<int:document_id>")
@@ -751,8 +769,15 @@ def create_app():
             doc_id = int(doc_id)
         except (TypeError, ValueError):
             return jsonify({"error": "document_id (int) is required"}), 400
-        if not method or not intended_for or not isinstance(secret, str) or not isinstance(key, str):
-            return jsonify({"error": "method, intended_for, secret, and key are required"}), 400
+        if (
+            not isinstance(method, str) or not method
+            or not isinstance(intended_for, str) or not intended_for
+            or not isinstance(secret, str) or not secret
+            or not isinstance(key, str) or not key
+        ):
+            return jsonify({
+                "error": "method, intended_for, secret, and key must have valid types"
+            }), 400
 
         # lookup the document; enforce ownership
         try:
@@ -761,10 +786,13 @@ def create_app():
                     text("""
                         SELECT id, name, path
                         FROM Documents
-                        WHERE id = :id
+                        WHERE id = :id AND ownerid = :ownerid
                         LIMIT 1
                     """),
-                    {"id": doc_id},
+                    {
+                        "id": doc_id,
+                        "ownerid": g.user["id"],
+                    },
                 ).first()
         except Exception as e:
             return jsonify({"error": f"database error: {str(e)}"}), 503
