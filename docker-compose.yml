@@ -10,6 +10,13 @@ services:
     volumes:
       - user-files:/app/storage
       - ./server/keys:/app/keys:ro
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+        
     environment:
       - PYTHONUNBUFFERED=1
       # DB connection details for future use by the API
@@ -23,6 +30,7 @@ services:
       - RMAP_WATERMARK_METHOD=${RMAP_WATERMARK_METHOD}
       - RMAP_KEY_PASSPHRASE=${RMAP_KEY_PASSPHRASE}
       - RMAP_DOCUMENT_ID=${RMAP_DOCUMENT_ID}
+    
     depends_on:
       db:
         condition: service_healthy

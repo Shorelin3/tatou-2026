@@ -10,7 +10,7 @@ dependencies = [
 	"PyMySQL==1.1.2",
 	"SQLAlchemy==2.0.43",
 	"dill==0.4.0",
-	"rmap @ git+https://github.com/nharrand/RMAP.git@v1.0.2"
+	"rmap @ https://github.com/nharrand/RMAP/releases/download/v2.0.0/rmap-2.0.0-py3-none-any.whl"
 	]
 
 [project.optional-dependencies]
@@ -25,3 +25,9 @@ python_files = ["test_*.py"]
 
 [project.scripts]
 pdfwm = "watermarking_cli:main"                 # now you can run `pdfwm methods`
+[tool.mutmut]
+source_paths = ["src/add_after_eof.py"]
+also_copy = ["src/watermarking_method.py"]
+pytest_add_cli_args_test_selection = ["test/test_add_after_eof_mutation.py"]
+debug = true
+

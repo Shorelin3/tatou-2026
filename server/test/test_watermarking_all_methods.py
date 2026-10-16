@@ -4,6 +4,7 @@ import importlib
 import inspect
 from pathlib import Path
 import pytest
+import fitz
 
 
 # --------- collect all methods from the registry ----------
@@ -23,16 +24,27 @@ if not CASES:
 
 
 # --------- fixtures ----------
+#@pytest.fixture(scope="session")
+#def sample_pdf_path(tmp_path_factory) -> Path:
+#    """Minimal but recognizable PDF bytes."""
+#    pdf = tmp_path_factory.mktemp("pdfs") / "sample.pdf"
+#    pdf.write_bytes(
+#        b"%PDF-1.4\n"
+#        b"1 0 obj\n<< /Type /Catalog >>\nendobj\n"
+#        b"%%EOF\n"
+#    )
+#    return pdf
 @pytest.fixture(scope="session")
 def sample_pdf_path(tmp_path_factory) -> Path:
-    """Minimal but recognizable PDF bytes."""
-    pdf = tmp_path_factory.mktemp("pdfs") / "sample.pdf"
-    pdf.write_bytes(
-        b"%PDF-1.4\n"
-        b"1 0 obj\n<< /Type /Catalog >>\nendobj\n"
-        b"%%EOF\n"
-    )
-    return pdf
+    """Create a valid one-page PDF for watermarking tests."""
+    pdf_path = tmp_path_factory.mktemp("pdfs") / "sample.pdf"
+
+    with fitz.open() as pdf:
+        page = pdf.new_page()
+        page.insert_text((72, 72), "Sample document for watermark testing")
+        pdf.save(pdf_path)
+
+    return pdf_path
 
 @pytest.fixture(scope="session")
 def secret() -> str:

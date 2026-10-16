@@ -3,10 +3,15 @@ import io
 import hashlib
 import uuid
 import datetime as dt
+import fitz
+import time
+import logging
+
 from pathlib import Path
 from functools import wraps
 
 from flask import Flask, jsonify, request, g, send_file
+from security_monitoring import SecurityMonitor
 from rmap import RMAPServer, RMAPError
 from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -28,6 +33,9 @@ from watermarking_method import WatermarkingMethod
 
 def create_app():
     app = Flask(__name__)
+    app.logger.setLevel(logging.INFO)
+    
+    security_monitor = SecurityMonitor()
 
     # --- Config ---
     app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
@@ -72,6 +80,43 @@ def create_app():
 
     app.config["STORAGE_DIR"].mkdir(parents=True, exist_ok=True)
 
+    # --- Request Logging ---
+    @app.before_request
+    def log_request_start():
+        request.environ["request_start_time"] = time.monotonic()
+    
+    @app.after_request
+    def log_request_end(response):
+        start_time = request.environ.get("request_start_time")
+        duration_ms = (
+            (time.monotonic() - start_time) * 1000
+            if start_time is not None
+            else -1
+        )
+
+        log_path = request.path 
+
+        if request.endpoint == "get_version":
+            log_path = "/api/get-version/<redacted>"
+
+        app.logger.info(
+            "HTTP request method=%s path=%s status=%s duration_ms=%.1f ip=%s",
+            request.method,
+            log_path,
+            response.status_code,
+            duration_ms,
+            request.remote_addr,
+        )
+
+        if 500 <= response.status_code < 600:
+            security_monitor.record_server_error(
+                response.status_code,
+                log_path,
+                app.logger,
+            )
+
+        return response
+    
     # --- RMAP ---
     rmap_server = None
 
@@ -116,15 +161,41 @@ def create_app():
         def wrapper(*args, **kwargs):
             auth = request.headers.get("Authorization", "")
             if not auth.startswith("Bearer "):
+                app.logger.warning(
+                    "Authentication failed: missing or invalid Authorization header path=%s ip=%s",
+                    request.path,
+                    request.remote_addr,
+                )
                 return _auth_error("Missing or invalid Authorization header")
+
             token = auth.split(" ", 1)[1].strip()
             try:
                 data = _serializer().loads(token, max_age=app.config["TOKEN_TTL_SECONDS"])
             except SignatureExpired:
+                app.logger.warning(
+                    "Authentication failed: expired token path=%s ip=%s",
+                    request.path,
+                    request.remote_addr,
+                )
                 return _auth_error("Token expired")
             except BadSignature:
+                app.logger.warning(
+                    "Authentication failed: invalid token path=%s ip=%s",
+                    request.path,
+                    request.remote_addr,
+                )
                 return _auth_error("Invalid token")
             g.user = {"id": int(data["uid"]), "login": data["login"], "email": data.get("email")}
+
+            token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+            
+            security_monitor.record_token_use(
+                token_id,
+                g.user["id"],
+                request.remote_addr,
+                app.logger,
+            )
+
             return f(*args, **kwargs)
         return wrapper
 
@@ -145,17 +216,23 @@ def create_app():
     def home():
         return app.send_static_file("index.html")
     
-    @app.get("/healthz")
+    @app.get("/api/healthz")
     def healthz():
         try:
             with get_engine().connect() as conn:
                 conn.execute(text("SELECT 1"))
-            db_ok = True
+            return jsonify({
+                "message": "The server is up and running.",
+                "db_connected": True,
+            }), 200
         except Exception:
-            db_ok = False
-        return jsonify({"message": "The server is up and running.", "db_connected": db_ok}), 200
+            app.logger.exception("Health check failed: database unavailable")
+            return jsonify({
+                "message": "The server is running but the db is unavailable",
+                "db_connected": False,
+            }), 503
 
-    @app.post("/rmap-initiate")
+    @app.post("/api/rmap-initiate")
     def rmap_initiate():
         if rmap_server is None:
             return jsonify({"error": "RMAP is not configured"}), 503
@@ -165,9 +242,16 @@ def create_app():
             return jsonify(response)
         except Exception as exc:
             app.logger.warning("RMAP initiate failed: %s", exc)
+
+            security_monitor.record_rmap_auth_failure(
+                request.remote_addr,
+                "/rmap-initiate",
+                app.logger,
+            )
+
             return jsonify({"error": "RMAP authentication failed"}), 400
 
-    @app.post("/rmap-get-link")
+    @app.post("/api/rmap-get-link")
     def rmap_get_link():
         if rmap_server is None:
             return jsonify({"error": "RMAP is not configured"}), 503
@@ -177,6 +261,18 @@ def create_app():
                 request.get_json()
             )
 
+        except Exception as exc:
+            app.logger.warning("RMAP get-link authentication failed: %s", exc)
+
+            security_monitor.record_rmap_auth_failure(
+                request.remote_addr,
+                "/rmap-get-link",
+                app.logger,
+            )
+
+            return jsonify({"error": "RMAP authentication failed"}), 400
+        
+        try:
             document_id = app.config["RMAP_DOCUMENT_ID"]
 
             # Look up the document configured for RMAP watermarking.
@@ -350,12 +446,21 @@ def create_app():
     # POST /api/login {login, password}
     @app.post("/api/login")
     def login():
-        payload = request.get_json(silent=True) or {}
-        email = (payload.get("email") or "").strip()
-        password = payload.get("password") or ""
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "JSON body must be an object"}), 400
+
+        email = payload.get("email")
+        password = payload.get("password")
+
+        if not isinstance(email, str) or not isinstance(password, str):
+            return jsonify({"error": "email and password must be strings"}), 400
+
+        email = email.strip()
+
         if not email or not password:
             return jsonify({"error": "email and password are required"}), 400
-
+        
         try:
             with get_engine().connect() as conn:
                 row = conn.execute(
@@ -365,7 +470,11 @@ def create_app():
         except Exception as e:
             return jsonify({"error": f"database error: {str(e)}"}), 503
 
+        
         if not row or not check_password_hash(row.hpassword, password):
+            ip = request.remote_addr or "unknown"
+            security_monitor.record_failed_login(ip, app.logger)
+
             return jsonify({"error": "invalid credentials"}), 401
 
         token = _serializer().dumps({"uid": int(row.id), "login": row.login, "email": row.email})
@@ -382,6 +491,17 @@ def create_app():
             return jsonify({"error": "empty filename"}), 400
 
         fname = file.filename
+
+        # Reject files that cannot be opened as PDFs.
+        file_bytes = file.read()
+        try:
+            with fitz.open(stream=file_bytes, filetype="pdf") as pdf:
+                if not pdf.is_pdf or pdf.page_count < 1:
+                    return jsonify({"error": "file must be a valid PDF"}), 400
+        except Exception:
+            return jsonify({"error": "file must be a valid PDF"}), 400
+
+        file.stream.seek(0)
 
         user_dir = app.config["STORAGE_DIR"] / "files" / g.user["login"]
         user_dir.mkdir(parents=True, exist_ok=True)
@@ -422,6 +542,12 @@ def create_app():
         except Exception as e:
             return jsonify({"error": f"database error: {str(e)}"}), 503
 
+        app.logger.info(
+            "Document uploaded: user_id=%s document_id=%s ip=%s",
+            g.user["id"],
+            int(row.id),
+            request.remote_addr,
+        )
         return jsonify({
             "id": int(row.id),
             "name": row.name,
@@ -456,8 +582,6 @@ def create_app():
             "size": int(r.size),
         } for r in rows]
         return jsonify({"documents": docs}), 200
-
-
 
     # GET /api/list-versions
     @app.get("/api/list-versions")
@@ -551,11 +675,26 @@ def create_app():
                     """),
                     {"id": document_id, "uid": int(g.user["id"])},
                 ).first()
-        except Exception as e:
-            return jsonify({"error": f"database error: {str(e)}"}), 503
+        except Exception:
+            app.logger.exception(
+                "Document retrieval failed: db error user_id=%s document_id=%s ip=%s",
+                g.user["id"],
+                document_id,
+                request.remote_addr,
+            )
+            return jsonify({"error": "service unavailable"}), 503
 
         # Don’t leak whether a doc exists for another user
         if not row:
+            ip = request.remote_addr or "unknown"
+
+            security_monitor.record_denied_document_access(
+                ip,
+                g.user["id"],
+                document_id,
+                app.logger,
+            )
+
             return jsonify({"error": "document not found"}), 404
 
         file_path = Path(row.path)
@@ -580,6 +719,13 @@ def create_app():
             max_age=0,
             last_modified=file_path.stat().st_mtime,
         )
+        app.logger.info(
+            "Document accessed: user_id=%s document_id=%s ip=%s",
+            g.user["id"],
+            document_id,
+            request.remote_addr,
+        )
+
         # Strong validator
         if isinstance(row.sha256_hex, str) and row.sha256_hex:
             resp.set_etag(row.sha256_hex.lower())
@@ -653,73 +799,124 @@ def create_app():
                 raise RuntimeError(f"path {fp} escapes storage root {storage_root}")
         return fp
 
+
     # DELETE /api/delete-document  (and variants)
-    @app.route("/api/delete-document", methods=["DELETE", "POST"])  # POST supported for convenience
+    @app.route("/api/delete-document", methods=["DELETE", "POST"])
     @app.route("/api/delete-document/<document_id>", methods=["DELETE"])
+    @require_auth
     def delete_document(document_id: int | None = None):
-        # accept id from path, query (?id= / ?documentid=), or JSON body on POST
-        if not document_id:
+        # Accept the ID from the path, query parameters, or JSON body.
+        if document_id is None:
             document_id = (
                 request.args.get("id")
                 or request.args.get("documentid")
-                or (request.is_json and (request.get_json(silent=True) or {}).get("id"))
+                or (
+                    (request.get_json(silent=True) or {}).get("id")
+                    if request.is_json
+                    else None
+                )
             )
+ 
+ 
+        # Validate the document ID.
         try:
-            doc_id = document_id
+            doc_id = int(document_id)
+            if doc_id <= 0:
+                raise ValueError
         except (TypeError, ValueError):
-            return jsonify({"error": "document id required"}), 400
+            return jsonify({"error": "valid document id required"}), 400
 
-        # Fetch the document (enforce ownership)
+
+        # Retrieve only a document owned by the authenticated user.
         try:
             with get_engine().connect() as conn:
-                query = "SELECT * FROM Documents WHERE id = " + doc_id
-                row = conn.execute(text(query)).first()
-        except Exception as e:
-            return jsonify({"error": f"database error: {str(e)}"}), 503
+                row = conn.execute(
+                    text("""
+                        SELECT *
+                        FROM Documents
+                        WHERE id = :id AND ownerid = :ownerid
+                    """),
+                    {
+                        "id": doc_id,
+                        "ownerid": int(g.user["id"]),
+                    },
+                ).first()
+        except Exception:
+            app.logger.exception(
+                "Database error while checking document ownership"
+            )
+            return jsonify({"error": "database error"}), 503
 
-        if not row:
-            # Don’t reveal others’ docs—just say not found
+
+        if row is None:
             return jsonify({"error": "document not found"}), 404
 
-        # Resolve and delete file (best effort)
+
+        # Validate the file path before deleting the database record.
         storage_root = Path(app.config["STORAGE_DIR"])
+
+
+        try:
+            file_path = _safe_resolve_under_storage(row.path, storage_root)
+        except (RuntimeError, OSError, ValueError):
+            app.logger.exception(
+                "Document path failed storage safety check for id=%s",
+                doc_id,
+            )
+            return jsonify({"error": "document path invalid"}), 500
+ 
+ 
+        # Delete the database record only if ownership still matches.
+        try:
+            with get_engine().begin() as conn:
+                result = conn.execute(
+                    text("""
+                        DELETE FROM Documents
+                        WHERE id = :id AND ownerid = :ownerid
+                    """),
+                    {
+                        "id": doc_id,
+                        "ownerid": int(g.user["id"]),
+                    },
+                )
+ 
+ 
+                if result.rowcount != 1:
+                    return jsonify({"error": "document not found"}), 404
+ 
+ 
+        except Exception:
+            app.logger.exception("Database error during document deletion")
+            return jsonify({"error": "database error during delete"}), 503
+
+
+        # Remove the file after the database deletion succeeds.
         file_deleted = False
         file_missing = False
         delete_error = None
+
+
         try:
-            fp = _safe_resolve_under_storage(row.path, storage_root)
-            if fp.exists():
-                try:
-                    fp.unlink()
-                    file_deleted = True
-                except Exception as e:
-                    delete_error = f"failed to delete file: {e}"
-                    app.logger.warning("Failed to delete file %s for doc id=%s: %s", fp, row.id, e)
+            if file_path.exists():
+                file_path.unlink()
+                file_deleted = True
             else:
                 file_missing = True
-        except RuntimeError as e:
-            # Path escapes storage root; refuse to touch the file
-            delete_error = str(e)
-            app.logger.error("Path safety check failed for doc id=%s: %s", row.id, e)
-
-        # Delete DB row (will cascade to Version if FK has ON DELETE CASCADE)
-        try:
-            with get_engine().begin() as conn:
-                # If your schema does NOT have ON DELETE CASCADE on Version.documentid,
-                # uncomment the next line first:
-                # conn.execute(text("DELETE FROM Version WHERE documentid = :id"), {"id": doc_id})
-                conn.execute(text("DELETE FROM Documents WHERE id = :id"), {"id": doc_id})
-        except Exception as e:
-            return jsonify({"error": f"database error during delete: {str(e)}"}), 503
-
+        except OSError:
+            delete_error = "document record deleted but file removal failed"
+            app.logger.exception(
+                "Failed to delete file for document id=%s",
+                doc_id,
+            )
+ 
+ 
         return jsonify({
             "deleted": True,
             "id": doc_id,
             "file_deleted": file_deleted,
             "file_missing": file_missing,
-            "note": delete_error,   # null/omitted if everything was fine
-        }), 200
-        
+            "note": delete_error,
+        }), 200   
         
     # POST /api/create-watermark or /api/create-watermark/<id>  → create watermarked pdf and returns metadata
     @app.post("/api/create-watermark")
@@ -751,8 +948,15 @@ def create_app():
             doc_id = int(doc_id)
         except (TypeError, ValueError):
             return jsonify({"error": "document_id (int) is required"}), 400
-        if not method or not intended_for or not isinstance(secret, str) or not isinstance(key, str):
-            return jsonify({"error": "method, intended_for, secret, and key are required"}), 400
+        if (
+            not isinstance(method, str) or not method
+            or not isinstance(intended_for, str) or not intended_for
+            or not isinstance(secret, str) or not secret
+            or not isinstance(key, str) or not key
+        ):
+            return jsonify({
+                "error": "method, intended_for, secret, and key must have valid types"
+            }), 400
 
         # lookup the document; enforce ownership
         try:
@@ -761,10 +965,13 @@ def create_app():
                     text("""
                         SELECT id, name, path
                         FROM Documents
-                        WHERE id = :id
+                        WHERE id = :id AND ownerid = :ownerid
                         LIMIT 1
                     """),
-                    {"id": doc_id},
+                    {
+                        "id": doc_id,
+                        "ownerid": g.user["id"],
+                    },
                 ).first()
         except Exception as e:
             return jsonify({"error": f"database error: {str(e)}"}), 503
@@ -856,6 +1063,15 @@ def create_app():
             except Exception:
                 pass
             return jsonify({"error": f"database error during version insert: {e}"}), 503
+        
+        app.logger.info(
+            "Watermarked version created: user_id=%s document_id=%s version_id=%s method=%s ip=%s",
+            g.user["id"],
+            doc_id,
+            vid,
+            method,
+            request.remote_addr,
+        )
 
         return jsonify({
             "id": vid,
@@ -894,7 +1110,7 @@ def create_app():
             return jsonify({"error": f"plugin path error: {e}"}), 500
 
         if not plugin_path.exists():
-            return jsonify({"error": f"plugin file not found: {safe}"}), 404
+            return jsonify({"error": f"plugin file not found: {filename}"}), 404
 
         # Unpickle the object (dill if available; else std pickle)
         try:
@@ -925,6 +1141,14 @@ def create_app():
             
         # Register the class (not an instance) so you can instantiate as needed later
         WMUtils.METHODS[method_name] = cls()
+
+        app.logger.info(
+            "Plugin loaded: user_id=%s filename=%s registered_as=%s ip=%s",
+            g.user["id"],
+            filename,
+            method_name,
+            request.remote_addr,
+        )
         
         return jsonify({
             "loaded": True,
@@ -977,16 +1201,20 @@ def create_app():
         if not method or not isinstance(key, str):
             return jsonify({"error": "method, and key are required"}), 400
 
-        # lookup the document; FIXME enforce ownership
+        # retrieve document and enforce ownership
         try:
             with get_engine().connect() as conn:
                 row = conn.execute(
                     text("""
                         SELECT id, name, path
                         FROM Documents
-                        WHERE id = :id
+                        WHERE id = :id AND ownerid = :ownerid
+                        LIMIT 1
                     """),
-                    {"id": doc_id},
+                    {
+                        "id": doc_id,
+                        "ownerid": int(g.user["id"]),
+                    },
                 ).first()
         except Exception as e:
             return jsonify({"error": f"database error: {str(e)}"}), 503
