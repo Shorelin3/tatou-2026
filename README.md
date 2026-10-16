@@ -54,7 +54,7 @@ Following software is required:
 ```bash
 git clone https://github.com/Shorelin3/tatou-2026.git
 cd tatou-2026
-````
+```
 
 ### 2. Set up the Python environment
 Go to the server directory:
@@ -116,42 +116,90 @@ cd server
 source .venv/bin/activate
 ```
 
-Run the complete test suite:
+Run the pytest test suite, excluding the Atheris fuzzing harnesses:
 
 ```bash
 python -m pytest
+  --ignore=test/test_fuzz_atheris_a01.py \
+  --ignore=test/test_fuzz_atheris_a02.py \
+  --ignore=test/test_fuzz_atheris_a03.py \
+  --ignore=test/test_fuzz_atheris_extended_a02.py \
+  -v
 ```
 
-Run the tests with verbose output:
+To run a specific test file: 
 
 ```bash
-python -m pytest -v
-```
-
-A specific test file can also be executed, for example:
-
-```bash
-python -m pytest test/test_security_monitoring.py -v
+python -m pytest test/<test_filename>.py -v
 ```
 
 ### API tests
 API tests are included in the test suite.
 
-Run the main API tests with:
+To run a specific API test file, replace `<test_filename>` with the name of the test file:
 
 ```bash
-python -m pytest test/test_api.py -v
+python -m pytest test/<test_filename>.py -v
 ```
 
-Additional API, RMAP, regression, fuzzing, watermarking, and security tests are available in the `server/test/` directory.
+Additional API tests are available in the `server/test/` directory.
 
 ### Coverage Analysis
 
-Generated coverage reports are stored in:
+Test coverage is measured using pytest-cov. 
 
-```text
-artifacts/common/coverage_html/
+To run the coverage analysis from the project root directory: 
+
+```bash
+DB_HOST=127.0.0.1 \
+DB_NAME=tatou_test \
+DB_PASSWORD="$(docker compose exec -T server printenv DB_PASSWORD | tr -d '\r\n')" \
+STORAGE_DIR="$PWD/storage_test" \
+python -m pytest server/test \
+ --ignore=server/test/test_fuzz_atheris_a01.py \
+ --ignore=server/test/test_fuzz_atheris_a02.py \
+ --ignore=server/test/test_fuzz_atheris_a03.py \
+ --ignore=server/test/test_fuzz_atheris_extended_a02.py \
+ --cov=server/src \
+ --cov-branch \
+ --cov-report=term-missing \
+ --cov-report=html:coverage_html \
+ -v
 ```
+
+**Important:** The coverage tests use a separate database (`tatou_test`) and storage directory (`storage_test`) to avoid modifying the application's regular data. 
+See [Test Database Setup](#test-database-setup) for instructions.
+
+The generated HTML coverage report is available in `coverage_html`/.
+A copy is available in `artifacts/common/coverage_html/`.
+
+### Test Database Setup
+
+Start the Docker containers:
+
+```bash
+docker compose up -d
+```
+
+Create the test database, import the Tatou schema, and grant access to the configured database user:
+
+```bash
+docker compose exec -T db sh -c '
+mariadb -u root -p"$MARIADB_ROOT_PASSWORD" <<SQL
+CREATE DATABASE IF NOT EXISTS tatou_test;
+GRANT ALL PRIVILEGES ON tatou_test.* TO '"'"'$MARIADB_USER'"'"'@'"'"'%'"'"';
+SQL
+'
+```
+
+Import the Tatou database schema into the test database:
+
+```bash
+sed 's/`tatou`/`tatou_test`/g' db/tatou.sql | \
+docker compose exec -T db sh -c 'mariadb -u root -p"$MARIADB_ROOT_PASSWORD"'
+```
+
+The coverage tests can then be run using the command in the [Coverage Analysis section](#coverage-analysis)
 
 ---
 
@@ -175,7 +223,9 @@ server/test/test_add_after_eof_mutation.py
 
 ### Fuzz Testing
 
-The fuzz tests are located in:
+Atheris fuzzing harnesses are executed separately and should be excluded from standard pytest test collection. 
+
+The fuzzing scripts are located in: 
 
 ```text
 server/test/test_fuzz_atheris_a01.py
@@ -183,6 +233,9 @@ server/test/test_fuzz_atheris_a02.py
 server/test/test_fuzz_atheris_a03.py
 server/test/test_fuzz_atheris_extended_a02.py
 ```
+
+Detailed fuzzing documentation is available in
+[Specialization A Artifacts](artifacts/joel/README.md).
 
 ### Regression Testing
 
@@ -304,7 +357,6 @@ FLAG_2=<your_flag_value>
 RMAP_WATERMARK_KEY=<watermark_key>
 RMAP_WATERMARK_METHOD=<watermark_method>
 RMAP_KEY_PASSPHRASE=<key_passphrase>
-RMAP_DOCUMENT_ID=<document_id>
 ```
 
 Real passwords, flags, and other secrets should only be stored in `.env` and should not be committed to the repository.
@@ -317,7 +369,7 @@ tatou-2026/
 ├── artifacts/
 │   ├── common/                              # Shared Phase II artifacts
 │   │   ├── specification_test_mapping.md    # Mapping between specifications and tests
-│   │   └── test-coverage/                   # Test coverage artifacts
+│   │   └── coverage_html/                   # Test coverage artifacts
 │   │
 │   ├── ebba/                                # Operational Security specialization
 │   │   ├── README.md
@@ -334,10 +386,16 @@ tatou-2026/
 │   │   ├── incident_report_uploaded_files.md
 │   │   └── specializationD_report.md        # Operational Security report
 │   │
-│   ├── joel/                                # Phase II specialization artifacts
-│   │   └── README.md
 │   │
-│   └── melissa/                             # Phase II specialization artifacts
+│   ├── joel/                                # Phase II specialization
+│   │   ├── README.md
+│   │   ├── bugs_discovered.md
+│   │   ├── fuzzer_configurations.md
+│   │   ├── fuzzing_results.md                
+│   │   └── non_regression_tests.md
+│   │
+│   │
+│   └── melissa/                             # Phase II specialization 
 │       └── mutation-testing/
 │
 ├── db/
@@ -425,7 +483,7 @@ Detailed API specifications are available in `server/API.md`.
 
 ---
 ## Contributors
-**Group 15*
+**Group 15**
 - Ebba Arrhenius Winblad
 - Joel Oskarsson
 - Melissa Zaade
